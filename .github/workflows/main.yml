@@ -1,3 +1,19 @@
+# =============================================================================
+# CloudFormation Multi-Account Deployment Workflow
+# -----------------------------------------------------------------------------
+# Target accounts (all production):
+#   - ingest
+#   - datalake
+#   - security
+#   - audit
+#
+# - Pushes to feature/* branches  -> create a CloudFormation Change Set in each
+#                                    account (dry-run / plan mode, no execution)
+# - Pushes to master              -> deploy the stack to all 4 accounts
+#                                    (gated by manual approval)
+# - Authentication uses GitHub OIDC (no static AWS keys)
+# =============================================================================
+
 name: CloudFormation Deploy
 
 on:
@@ -207,6 +223,26 @@ jobs:
               Repo=${{ github.repository }} \
               Commit=${{ github.sha }} \
               Account=${{ matrix.account.name }}
+
+      # On failure, dump the actual CloudFormation events that caused the stack
+      # create/update to fail. Without this, the workflow only shows the generic
+      # "Failed to create/update the stack" message.
+      - name: Show stack failure events
+        if: failure()
+        run: |
+          set +e
+          echo "## CloudFormation failure events for ${{ matrix.account.name }}" >> "$GITHUB_STEP_SUMMARY"
+          aws cloudformation describe-stack-events \
+            --stack-name "${STACK_NAME}" \
+            --query 'StackEvents[?contains(ResourceStatus, `FAILED`)].[Timestamp,LogicalResourceId,ResourceType,ResourceStatus,ResourceStatusReason]' \
+            --output table | tee -a "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Current stack status" >> "$GITHUB_STEP_SUMMARY"
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query 'Stacks[0].[StackStatus,StackStatusReason]' \
+            --output table | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Surface stack outputs into the job summary for easy inspection.
       - name: Report stack outputs
