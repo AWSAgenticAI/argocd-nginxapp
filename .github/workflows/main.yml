@@ -1,0 +1,220 @@
+name: CloudFormation Deploy
+
+on:
+  push:
+    branches:
+      - "feature/**"   # plan / change-set only
+      - "master"       # full deployment (with approval)
+
+# OIDC requires id-token: write. contents: read is needed for actions/checkout.
+permissions:
+  id-token: write
+  contents: read
+
+# Cancel in-progress runs for the same branch when a new commit lands.
+concurrency:
+  group: cfn-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: my-application-stack-test
+  TEMPLATE_FILE: cloudformation.yaml
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Plan job: feature branches only
+  # Creates a Change Set against each of the 4 prod accounts so reviewers can
+  # see exactly what would change. The Change Set is NOT executed.
+  # ---------------------------------------------------------------------------
+  plan:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: Plan (${{ matrix.account.name }})
+    runs-on: ubuntu-latest
+    environment: feature
+    strategy:
+      fail-fast: false
+      matrix:
+        account:
+          - name: DEV
+            role_arn: arn:aws:iam::337040980814:role/github-cicd-using-oidc
+
+
+    steps:
+      # Pull the repository so the CloudFormation template is on disk.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Validate the template syntax before doing anything cloud-side.
+      - name: Validate CloudFormation template
+        run: |
+          echo "Validating ${TEMPLATE_FILE}..."
+          # cfn-lint catches issues that aws cloudformation validate-template misses.
+          pip install --quiet cfn-lint
+          cfn-lint "${TEMPLATE_FILE}"
+
+      # Exchange the GitHub OIDC token for short-lived AWS credentials.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.account.role_arn }}
+          role-session-name: gha-plan-${{ matrix.account.name }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: List files 
+        run: |
+          ls
+
+      # Server-side template validation in the target account.
+      - name: aws cloudformation validate-template
+        run: |
+          aws cloudformation validate-template \
+            --template-body "file://${TEMPLATE_FILE}"
+
+      # Decide whether the stack already exists so we pick the right
+      # change-set type (CREATE vs UPDATE).
+      - name: Determine change-set type
+        id: cs_type
+        run: |
+          set -euo pipefail
+          if aws cloudformation describe-stacks --stack-name "${STACK_NAME}" >/dev/null 2>&1; then
+            echo "type=UPDATE" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=CREATE" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Create the Change Set. This does NOT modify any resources.
+      - name: Create CloudFormation Change Set
+        id: create_cs
+        run: |
+          set -euo pipefail
+          CHANGE_SET_NAME="cs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "name=${CHANGE_SET_NAME}" >> "$GITHUB_OUTPUT"
+
+          aws cloudformation create-change-set \
+            --stack-name "${STACK_NAME}" \
+            --change-set-name "${CHANGE_SET_NAME}" \
+            --change-set-type "${{ steps.cs_type.outputs.type }}" \
+            --template-body "file://${TEMPLATE_FILE}" \
+            --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+            --description "Plan for ${GITHUB_REF_NAME} @ ${GITHUB_SHA}"
+
+          # Wait until the Change Set is fully computed.
+          # `create-complete` succeeds when there are changes; we manually
+          # tolerate the "no changes" terminal state below.
+          aws cloudformation wait change-set-create-complete \
+            --stack-name "${STACK_NAME}" \
+            --change-set-name "${CHANGE_SET_NAME}" || true
+
+      # Render the planned changes into the job log so reviewers can read
+      # the diff directly from the GitHub UI.
+      - name: Show planned changes
+        run: |
+          set -euo pipefail
+          DESC=$(aws cloudformation describe-change-set \
+            --stack-name "${STACK_NAME}" \
+            --change-set-name "${{ steps.create_cs.outputs.name }}")
+
+          STATUS=$(echo "$DESC" | jq -r '.Status')
+          REASON=$(echo "$DESC" | jq -r '.StatusReason // ""')
+
+          echo "## Change Set for ${{ matrix.account.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Stack: \`${STACK_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Status: \`${STATUS}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # CloudFormation reports an empty change set as FAILED with this
+          # specific reason. Treat it as success (nothing to do).
+          if [[ "$STATUS" == "FAILED" && "$REASON" == *"didn't contain changes"* ]]; then
+            echo "No infrastructure changes detected." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$STATUS" != "CREATE_COMPLETE" ]]; then
+            echo "Change set creation failed: ${REASON}" >&2
+            exit 1
+          fi
+
+          echo "$DESC" | jq -r '
+            "| Action | Logical ID | Resource Type | Replacement |",
+            "|--------|------------|---------------|-------------|",
+            (.Changes[] | "| \(.ResourceChange.Action) | \(.ResourceChange.LogicalResourceId) | \(.ResourceChange.ResourceType) | \(.ResourceChange.Replacement // "-") |")
+          ' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Always clean up the Change Set so we don't accumulate them.
+      - name: Delete Change Set (cleanup)
+        if: always() && steps.create_cs.outputs.name != ''
+        run: |
+          aws cloudformation delete-change-set \
+            --stack-name "${STACK_NAME}" \
+            --change-set-name "${{ steps.create_cs.outputs.name }}" || true
+
+  # ---------------------------------------------------------------------------
+  # Deploy job: master branch only
+  # Performs the actual stack create/update in all 4 prod accounts in parallel.
+  #
+  # Manual approval is enforced by the `prod` GitHub Environment, which must
+  # be configured with "Required reviewers" in repo settings:
+  #   Settings -> Environments -> prod -> Required reviewers
+  # Each matrix job pauses at the start with status "Waiting" until an
+  # approver clicks "Review deployments -> Approve" in the GitHub UI.
+  # ---------------------------------------------------------------------------
+  deploy:
+    if: github.ref == 'refs/heads/master'
+    name: Deploy (${{ matrix.account.name }})
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+      url: https://console.aws.amazon.com/cloudformation/home?region=${{ env.AWS_REGION }}#/stacks
+    strategy:
+      # fail-fast=false so a failure in one account does not cancel the others;
+      # flip to true if you want strict all-or-nothing behavior.
+      fail-fast: false
+      matrix:
+        account:
+          - name: prod
+            role_arn: arn:aws:iam::337040980814:role/github-cicd-using-oidc
+
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate CloudFormation template
+        run: |
+          pip install --quiet cfn-lint
+          cfn-lint "${TEMPLATE_FILE}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.account.role_arn }}
+          role-session-name: gha-deploy-${{ matrix.account.name }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # `aws cloudformation deploy` handles create-vs-update transparently,
+      # uses a Change Set under the hood, and waits for completion.
+      # --no-fail-on-empty-changeset prevents a noop deploy from failing the job.
+      - name: Deploy CloudFormation stack
+        run: |
+          echo "Deploying ${STACK_NAME} to account '${{ matrix.account.name }}'"
+          aws cloudformation deploy \
+            --stack-name "${STACK_NAME}" \
+            --template-file "${TEMPLATE_FILE}" \
+            --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+            --no-fail-on-empty-changeset \
+            --tags \
+              ManagedBy=GitHubActions \
+              Repo=${{ github.repository }} \
+              Commit=${{ github.sha }} \
+              Account=${{ matrix.account.name }}
+
+      # Surface stack outputs into the job summary for easy inspection.
+      - name: Report stack outputs
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "## Deployment result for ${{ matrix.account.name }}" >> "$GITHUB_STEP_SUMMARY"
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}' \
+            --output table | tee -a "$GITHUB_STEP_SUMMARY" || true
