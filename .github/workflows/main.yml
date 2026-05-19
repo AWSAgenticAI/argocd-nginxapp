@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - "feature/**"   # plan / change-set only
-      - "master"       # full deployment (with approval)
+      - "main"       # full deployment (with approval)
 
 # OIDC requires id-token: write. contents: read is needed for actions/checkout.
 permissions:
@@ -159,7 +159,7 @@ jobs:
   # approver clicks "Review deployments -> Approve" in the GitHub UI.
   # ---------------------------------------------------------------------------
   deploy:
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/main'
     name: Deploy (${{ matrix.account.name }})
     runs-on: ubuntu-latest
     environment:
