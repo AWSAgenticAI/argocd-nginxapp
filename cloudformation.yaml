@@ -5,7 +5,7 @@ Resources:
   MyS3Bucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: AWSAgenticAI-bucket-12345  # Must be globally unique
+      BucketName: awsagenticai-bucket-12345  # 
       VersioningConfiguration:
         Status: Enabled
       PublicAccessBlockConfiguration:
