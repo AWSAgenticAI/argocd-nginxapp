@@ -46,7 +46,7 @@ jobs:
   plan:
     if: startsWith(github.ref, 'refs/heads/feature/')
     name: Plan (${{ matrix.account.name }})
-    runs-on: ubuntu-latest
+  ##  runs-on: ubuntu-latest
     environment: feature
     strategy:
       fail-fast: false
@@ -177,7 +177,7 @@ jobs:
   deploy:
     if: github.ref == 'refs/heads/main'
     name: Deploy (${{ matrix.account.name }})
-    runs-on: ubuntu-latest
+##    runs-on: ubuntu-latest
     environment:
       name: prod
       url: https://console.aws.amazon.com/cloudformation/home?region=${{ env.AWS_REGION }}#/stacks
